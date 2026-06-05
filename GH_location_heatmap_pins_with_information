@@ -1,0 +1,809 @@
+"""
+Google Location History – Heatmap + Top-15 Sensitive Pins (Hourly)
+Thesis: "Inferring Sensitive Personal Information from Google Location History
+         Using Data Visualization Techniques"
+Author: Matthijs Hagedoorn
+
+=== HOW TO USE ===
+
+1. Export your Google Location History as a single JSON file.
+   For instructions on how to do this, see:
+   https://support.google.com/maps/answer/6258979?hl=en&co=GENIE.Platform%3DAndroid
+
+2. Set JSON_FILE in CONFIGURATION below to the path of your exported JSON file.
+
+3. Adjust START_DATE and END_DATE to your desired date range.
+
+4. Run the script:
+       python GH_location_heatmap_pins_with_information.py
+
+5. Open the output file in a browser (no local server needed):
+       thesis_visualizations/location_heatmap_pins_with_information.html
+
+=== OUTPUT ===
+
+  Two layers:
+    1. Heatmap   — GPS density at each hour (where you typically are)
+    2. Top-15 pins — the 15 most-visited locations, with rich popups:
+                       - visit count, avg duration, total hours
+                       - bar chart: visits by hour of day
+                       - bar chart: visits by day of week
+                       - manual reclassification panel (color + label picker)
+
+  Weekday / Weekend toggle:
+    Switch between Mon-Fri and Sat-Sun hourly aggregates.
+
+=== DEPENDENCIES ===
+    pip install pandas numpy
+"""
+
+import json
+import re
+import os
+from datetime import datetime, timezone
+
+import pandas as pd
+import numpy as np
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# ---------------------------------------------
+# CONFIGURATION — only this section needs editing!
+# ---------------------------------------------
+
+JSON_FILE  = "Timeline.json"   # Place your exported JSON file in the same folder as this script and rename it to Timeline.json
+OUTPUT_DIR = "thesis_visualizations"
+START_DATE = datetime(2023, 2, 25, tzinfo=timezone.utc)   # Adjust to your data range
+END_DATE   = datetime(2026, 2, 25, tzinfo=timezone.utc)   # Adjust to your data range
+
+LOCAL_UTC_OFFSET = 1    # Adjust for your timezone: Netherlands = UTC+1 (winter) / UTC+2 (summer)
+
+AUTO_PLAY = True
+FRAME_MS  = 1400
+
+TOP_N_PINS = 15
+
+# Heatmap
+MAX_HEAT_PTS  = 6000
+HEAT_RADIUS   = 18
+HEAT_BLUR     = 28
+HEAT_GRADIENT = {
+    "0.2": "blue",
+    "0.5": "#1a7abf",
+    "0.75": "#f9c74f",
+    "1.0": "#f94144",
+}
+
+# Initial semantic classification
+SENSITIVE_TYPES = {
+    "HOME":      ("#e63946", "Home (own residence)"),
+    "WORK":      ("#457b9d", "Work / University"),
+    "SCHOOL":    ("#457b9d", "Work / University"),
+    "MEDICAL":   ("#2a9d8f", "Healthcare"),
+    "HOSPITAL":  ("#2a9d8f", "Healthcare"),
+    "PHARMACY":  ("#2a9d8f", "Healthcare"),
+    "RELIGIOUS": ("#e9c46a", "Religious Site"),
+    "CHURCH":    ("#e9c46a", "Religious Site"),
+    "MOSQUE":    ("#e9c46a", "Religious Site"),
+    "TEMPLE":    ("#e9c46a", "Religious Site"),
+    "GYM":       ("#f4a261", "Gym / Sports"),
+    "RESTAURANT":("#c77dff", "Restaurant / Cafe / Bar"),
+    "BAR":       ("#c77dff", "Restaurant / Cafe / Bar"),
+    "UNKNOWN":   ("#adb5bd", "Cannot determine"),
+}
+
+# Manual classification options in popup
+MANUAL_CLASSES = [
+    ("#e63946", "Home (own residence)"),
+    ("#ff6b6b", "Home (someone else's residence)"),
+    ("#457b9d", "Work / University"),
+    ("#2a9d8f", "Healthcare"),
+    ("#e9c46a", "Religious Site"),
+    ("#f4a261", "Gym / Sports"),
+    ("#c77dff", "Restaurant / Cafe / Bar"),
+    ("#52b788", "Shop / Supermarket"),
+    ("#ffd166", "Transport Hub"),
+    ("#80b918", "Outdoor / Nature / Park"),
+    ("#adb5bd", "Cannot determine"),
+]
+
+
+# ---------------------------------------------
+# HELPERS
+# ---------------------------------------------
+
+def parse_latlng(s: str) -> tuple:
+    nums = re.findall(r"[-+]?\d+\.\d+", s)
+    return float(nums[0]), float(nums[1])
+
+
+def parse_time(s: str) -> datetime:
+    try:
+        return datetime.fromisoformat(s).astimezone(timezone.utc)
+    except ValueError:
+        s2 = re.sub(r"([+-]\d{2}):(\d{2})$", r"\1\2", s)
+        return datetime.strptime(s2, "%Y-%m-%dT%H:%M:%S.%f%z").astimezone(timezone.utc)
+
+
+def categorise(sem: str) -> tuple:
+    for key, (col, label) in SENSITIVE_TYPES.items():
+        if key in sem.upper():
+            return col, label
+    return "#adb5bd", "Cannot determine"
+
+
+def load_segments(path: str) -> list:
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Cannot find data at: {path}")
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    segments = data.get("semanticSegments", data) if isinstance(data, dict) else data
+    return segments
+
+
+# ---------------------------------------------
+# PARSING — points and visits only
+# ---------------------------------------------
+
+def parse_data(segments: list):
+    point_rows = []
+    visit_rows = []
+
+    for seg in segments:
+        try:
+            t_start = parse_time(seg["startTime"])
+            t_end   = parse_time(seg["endTime"])
+        except Exception:
+            continue
+        if t_end < START_DATE or t_start > END_DATE:
+            continue
+
+        local_hour    = (t_start.hour + LOCAL_UTC_OFFSET) % 24
+        local_weekday = t_start.weekday()   # 0=Mon...6=Sun
+        is_weekend    = local_weekday >= 5
+
+        if "timelinePath" in seg:
+            for pt in seg["timelinePath"]:
+                try:
+                    lat, lon = parse_latlng(pt["point"])
+                    t = parse_time(pt["time"])
+                    pt_local_hour = (t.hour + LOCAL_UTC_OFFSET) % 24
+                    pt_weekend    = t.weekday() >= 5
+                    point_rows.append({
+                        "time": t, "lat": lat, "lon": lon,
+                        "local_hour": pt_local_hour,
+                        "is_weekend": pt_weekend,
+                    })
+                except Exception:
+                    continue
+
+        elif "visit" in seg:
+            v  = seg["visit"]
+            tc = v.get("topCandidate", {})
+            loc = tc.get("placeLocation", {}).get("latLng", "")
+            if not loc:
+                continue
+            try:
+                lat, lon   = parse_latlng(loc)
+                sem        = tc.get("semanticType", "UNKNOWN").upper()
+                col, label = categorise(sem)
+                dur_min    = (t_end - t_start).total_seconds() / 60
+                point_rows.append({
+                    "time": t_start, "lat": lat, "lon": lon,
+                    "local_hour": local_hour,
+                    "is_weekend": is_weekend,
+                })
+                visit_rows.append({
+                    "lat": lat, "lon": lon,
+                    "color": col, "label": label,
+                    "sem": sem,
+                    "duration_min": dur_min,
+                    "local_hour":   local_hour,
+                    "weekday":      local_weekday,
+                    "place_id":     tc.get("placeId", ""),
+                })
+            except Exception:
+                continue
+
+    if not point_rows:
+        return pd.DataFrame(), []
+
+    df = pd.DataFrame(point_rows)
+    df = df[(df["time"] >= START_DATE) & (df["time"] <= END_DATE)]
+    df = df.sort_values("time").reset_index(drop=True)
+
+    # Aggregate visit pins
+    # Group by place_id (like peer_classification_tool) for accurate coordinates.
+    # Fall back to rounded lat/lon grid for visits with no place_id.
+    pins = []
+    if visit_rows:
+        vdf = pd.DataFrame(visit_rows)
+
+        # Stable group key: prefer Google place_id, else lat/lon ~100m grid
+        vdf["group_key"] = vdf["place_id"].where(
+            vdf["place_id"] != "",
+            "ll:" + vdf["lat"].round(3).astype(str) + "," + vdf["lon"].round(3).astype(str)
+        )
+
+        for key, grp in vdf.groupby("group_key"):
+            mode_row     = grp.groupby(["color", "label"]).size().idxmax()
+            color, label = mode_row
+            visit_count  = len(grp)
+            total_hours  = grp["duration_min"].sum() / 60
+            avg_hours    = total_hours / visit_count if visit_count else 0
+
+            # Median of real coordinates — far more accurate than grid centroid
+            lat = round(float(grp["lat"].median()), 5)
+            lon = round(float(grp["lon"].median()), 5)
+
+            hour_dist = [0] * 24
+            for h in grp["local_hour"]:
+                hour_dist[int(h)] += 1
+
+            day_dist = [0] * 7
+            for d in grp["weekday"]:
+                day_dist[int(d)] += 1
+
+            pins.append({
+                "lat":         lat,
+                "lon":         lon,
+                "color":       color,
+                "label":       label,
+                "visit_count": visit_count,
+                "total_hours": round(total_hours, 2),
+                "avg_hours":   round(avg_hours, 2),
+                "hour_dist":   hour_dist,
+                "day_dist":    day_dist,
+            })
+
+        pins = sorted(pins, key=lambda x: x["visit_count"], reverse=True)[:TOP_N_PINS]
+
+    return df, pins
+
+
+# ---------------------------------------------
+# BUILD FRAMES  (heatmap only)
+# ---------------------------------------------
+
+def build_frames(df: pd.DataFrame):
+    wd_heat, wd_labels = [], []
+    we_heat, we_labels = [], []
+
+    df_wd = df[~df["is_weekend"]]
+    df_we = df[ df["is_weekend"]]
+
+    for hour in range(24):
+        for sub_df, h_list, l_list, day_label in [
+            (df_wd, wd_heat, wd_labels, "Weekday"),
+            (df_we, we_heat, we_labels, "Weekend"),
+        ]:
+            pts_df = sub_df[sub_df["local_hour"] == hour]
+            if len(pts_df) > MAX_HEAT_PTS:
+                pts_df = pts_df.sample(MAX_HEAT_PTS, random_state=42)
+            heat_pts = pts_df[["lat", "lon"]].dropna().values.tolist()
+            h_list.append(heat_pts)
+            l_list.append(
+                f"{hour:02d}:00 - {hour:02d}:59  |  {day_label}  |  {len(pts_df):,} pts"
+            )
+
+        print(
+            f"    Hour {hour:02d}  "
+            f"WD: {len(wd_heat[-1]):>4} pts   "
+            f"WE: {len(we_heat[-1]):>4} pts"
+        )
+
+    return wd_heat, wd_labels, we_heat, we_labels
+
+
+# ---------------------------------------------
+# GENERATE HTML
+# ---------------------------------------------
+
+def make_visualization(df: pd.DataFrame, pins: list):
+    print("  Building HTML ...")
+
+    centre_lat = round(float(df["lat"].median()), 6)
+    centre_lon = round(float(df["lon"].median()), 6)
+
+    wd_heat, wd_labels, we_heat, we_labels = build_frames(df)
+
+    wd_heat_json        = json.dumps(wd_heat,        separators=(",", ":"))
+    wd_labels_json      = json.dumps(wd_labels,      separators=(",", ":"))
+    we_heat_json        = json.dumps(we_heat,        separators=(",", ":"))
+    we_labels_json      = json.dumps(we_labels,      separators=(",", ":"))
+    gradient_json       = json.dumps(HEAT_GRADIENT,  separators=(",", ":"))
+    pins_json           = json.dumps(pins,           separators=(",", ":"))
+    manual_classes_json = json.dumps(MANUAL_CLASSES, separators=(",", ":"))
+    auto_play_js        = "startPlay();" if AUTO_PLAY else "// AUTO_PLAY off"
+
+    period_colours = []
+    for h in range(24):
+        if h < 6:    period_colours.append("#0d3b66")
+        elif h < 9:  period_colours.append("#f4a261")
+        elif h < 17: period_colours.append("#f9c74f")
+        elif h < 21: period_colours.append("#e76f51")
+        else:        period_colours.append("#457b9d")
+    period_colours_json = json.dumps(period_colours)
+
+    html = (
+        """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Location History - Heatmap + Pins</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0f0e17; font-family: monospace; color: #fffffe; }
+  #map { position: absolute; top: 0; left: 0; right: 0; bottom: 165px; }
+
+  #controls {
+    position: absolute; bottom: 0; left: 0; right: 0; height: 165px;
+    background: #1a1a2e; border-top: 1px solid #444;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 7px; padding: 8px 20px;
+  }
+
+  #top-row { display: flex; align-items: center; gap: 18px; }
+  #hour-label { font-size: 22px; font-weight: bold; letter-spacing: 1px; transition: color 0.4s; }
+
+  #mode-pill {
+    display: flex; border-radius: 20px; overflow: hidden;
+    border: 1px solid #555; font-size: 12px;
+  }
+  .mode-btn {
+    padding: 4px 14px; cursor: pointer; background: #2a2a4a;
+    color: #adb5bd; border: none; transition: background 0.2s, color 0.2s;
+  }
+  .mode-btn.active-wd { background: #1a4a8a; color: #7ec8f4; }
+  .mode-btn.active-we { background: #4a2a6a; color: #c47ef4; }
+
+  #sub-label { font-size: 11px; color: #adb5bd; }
+  #hour-strip { display: flex; gap: 2px; width: 90%; max-width: 900px; }
+  .hour-tick {
+    flex: 1; height: 8px; border-radius: 2px; cursor: pointer; opacity: 0.55;
+    transition: transform 0.15s, opacity 0.15s;
+  }
+  .hour-tick:hover { transform: scaleY(1.8); opacity: 1; }
+  .hour-tick.active { transform: scaleY(2.4); opacity: 1; }
+
+  #slider { width: 90%; max-width: 900px; accent-color: #f9c74f; cursor: pointer; }
+
+  #btn-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: center; }
+  button {
+    background: #2a2a4a; color: #fffffe; border: 1px solid #555;
+    border-radius: 5px; padding: 5px 14px; font-size: 15px; cursor: pointer;
+  }
+  button:hover { background: #3a3a6a; }
+  select { background: #2a2a4a; color: #fff; border: 1px solid #555; border-radius: 4px; padding: 2px 6px; }
+
+  .toggle-btn { font-size: 11px !important; padding: 3px 10px !important; border-radius: 12px !important; }
+  .toggle-btn.on  { background: #2a5a2a !important; border-color: #4a9a4a !important; color: #90ee90 !important; }
+  .toggle-btn.off { background: #5a2a2a !important; border-color: #9a4a4a !important; color: #ee9090 !important; }
+
+  #info-box {
+    position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+    z-index: 1000; background: rgba(26,26,46,0.88); padding: 8px 18px;
+    border-radius: 8px; border: 1px solid #444; font-size: 12px;
+    text-align: center; pointer-events: none; white-space: nowrap;
+  }
+  #mode-badge {
+    display: inline-block; padding: 2px 10px; border-radius: 10px;
+    font-weight: bold; margin-left: 8px; font-size: 11px;
+    transition: background 0.3s, color 0.3s;
+  }
+
+  .legend-box {
+    position: absolute; z-index: 1000;
+    background: #1a1a2e; padding: 10px 14px; border-radius: 8px;
+    border: 1px solid #444; font-size: 11px; line-height: 1.7;
+  }
+  .legend-box b { display: block; margin-bottom: 4px; }
+  .leg-row  { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+  .leg-dot  { width: 12px; height: 12px; border-radius: 2px; flex-shrink: 0; }
+
+  #legend-density { bottom: 180px; right: 12px; }
+  #legend-period  { bottom: 180px; left: 12px; }
+
+  /* Rich popup */
+  .pin-popup {
+    font-family: monospace; font-size: 12px; color: #fffffe;
+    background: #1a1a2e; border-radius: 8px; padding: 14px;
+    min-width: 270px; max-width: 310px;
+  }
+  .pin-popup h3 {
+    font-size: 13px; margin-bottom: 8px; padding-bottom: 6px;
+    border-bottom: 1px solid #444; padding-right: 20px;
+  }
+  .pin-stats {
+    display: grid; grid-template-columns: 1fr 1fr 1fr;
+    gap: 6px; margin-bottom: 10px;
+  }
+  .pin-stat { background: #2a2a4a; border-radius: 6px; padding: 6px 4px; text-align: center; }
+  .pin-stat .val { font-size: 15px; font-weight: bold; color: #f9c74f; }
+  .pin-stat .lbl { font-size: 9px; color: #adb5bd; margin-top: 2px; }
+
+  .chart-title {
+    font-size: 10px; color: #adb5bd; margin: 8px 0 4px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .bar-axis {
+    display: flex; justify-content: space-between;
+    font-size: 8px; color: #555; margin-top: 2px; margin-bottom: 4px;
+  }
+
+  .classify-section { margin-top: 10px; padding-top: 8px; border-top: 1px solid #333; }
+  .classify-section .chart-title { margin-top: 0; }
+  .classify-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px; margin-top: 4px; }
+  .cls-btn {
+    display: flex; align-items: center; gap: 5px; padding: 5px 7px;
+    border-radius: 5px; border: 1px solid #444; cursor: pointer;
+    background: #2a2a4a; font-size: 10px; color: #fffffe;
+    transition: background 0.15s, border-color 0.15s;
+    line-height: 1.3; text-align: left;
+  }
+  .cls-btn:hover { background: #3a3a6a; border-color: #666; }
+  .cls-btn.selected { border-color: #f9c74f !important; background: #3a3a2a !important; }
+  .cls-swatch {
+    width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0;
+    border: 1.5px solid rgba(255,255,255,0.4);
+  }
+
+  .leaflet-popup-content-wrapper {
+    background: #1a1a2e !important; border: 1px solid #444 !important;
+    border-radius: 10px !important; padding: 0 !important;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.6) !important;
+  }
+  .leaflet-popup-content { margin: 0 !important; }
+  .leaflet-popup-tip { background: #1a1a2e !important; }
+  .leaflet-popup-close-button {
+    color: #adb5bd !important; top: 8px !important;
+    right: 10px !important; font-size: 16px !important;
+  }
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div id="info-box">
+  <b>Heatmap + Top-15 Sensitive Locations</b>
+  &nbsp;|&nbsp; Hourly aggregate across 3 years
+  <span id="mode-badge">WEEKDAY</span>
+</div>
+
+<div class="legend-box" id="legend-density">
+  <b>GPS Density</b>
+  <div class="leg-row"><span class="leg-dot" style="background:#f94144"></span>High</div>
+  <div class="leg-row"><span class="leg-dot" style="background:#f9c74f"></span>Medium</div>
+  <div class="leg-row"><span class="leg-dot" style="background:#1a7abf"></span>Low</div>
+  <div class="leg-row"><span class="leg-dot" style="background:blue"></span>Sparse</div>
+  <div style="border-top:1px solid #444;margin:6px 0 4px;"></div>
+  <b>Pins (top 15 by visits)</b>
+  <div style="font-size:9px;color:#adb5bd;max-width:120px;line-height:1.4;margin-top:2px;">
+    Click any numbered pin to view stats and classify
+  </div>
+</div>
+
+<div class="legend-box" id="legend-period">
+  <b>Time of day</b>
+  <div class="leg-row"><span class="leg-dot" style="background:#0d3b66"></span>Night (00-05)</div>
+  <div class="leg-row"><span class="leg-dot" style="background:#f4a261"></span>Morning (06-08)</div>
+  <div class="leg-row"><span class="leg-dot" style="background:#f9c74f"></span>Day (09-16)</div>
+  <div class="leg-row"><span class="leg-dot" style="background:#e76f51"></span>Evening (17-20)</div>
+  <div class="leg-row"><span class="leg-dot" style="background:#457b9d"></span>Late night (21-23)</div>
+</div>
+
+<div id="controls">
+  <div id="top-row">
+    <div id="hour-label">00:00</div>
+    <div id="mode-pill">
+      <button class="mode-btn active-wd" id="btn-wd">Mon - Fri</button>
+      <button class="mode-btn"           id="btn-we">Sat - Sun</button>
+    </div>
+  </div>
+  <div id="sub-label"></div>
+  <div id="hour-strip"></div>
+  <input id="slider" type="range" min="0" max="23" value="0" step="1"/>
+  <div id="btn-row">
+    <button id="btn-prev">&#9664;</button>
+    <button id="btn-play">&#9654;</button>
+    <button id="btn-next">&#9654;|</button>
+    <button id="btn-heat" class="toggle-btn on">Heatmap ON</button>
+    <button id="btn-pins" class="toggle-btn on">Pins ON</button>
+    <span style="font-size:12px;color:#adb5bd;">Speed:
+      <select id="speed-select">
+        <option value="2800">0.5x</option>
+        <option value="1400" selected>1x</option>
+        <option value="700">2x</option>
+        <option value="350">4x</option>
+      </select>
+    </span>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+<script>
+"""
+        + "var WD_HEAT        = " + wd_heat_json + ";\n"
+        + "var WD_LABELS      = " + wd_labels_json + ";\n"
+        + "var WE_HEAT        = " + we_heat_json + ";\n"
+        + "var WE_LABELS      = " + we_labels_json + ";\n"
+        + "var PINS_DATA      = " + pins_json + ";\n"
+        + "var MANUAL_CLASSES = " + manual_classes_json + ";\n"
+        + "var PERIOD_COLS    = " + period_colours_json + ";\n"
+        + "var N = 24;\n"
+        + "var FRAME_MS = " + str(FRAME_MS) + ";\n"
+        + "var HEAT_RADIUS = " + str(HEAT_RADIUS) + ";\n"
+        + "var HEAT_BLUR   = " + str(HEAT_BLUR) + ";\n"
+        + "var GRADIENT    = " + gradient_json + ";\n"
+        + """
+var pinOverrides = {};
+var HEAT_DATA  = WD_HEAT;
+var LABEL_DATA = WD_LABELS;
+
+// Map
+var map = L.map("map", { center: ["""
+        + str(centre_lat) + ", " + str(centre_lon)
+        + """], zoom: 13 });
+L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+  attribution: "&copy; CartoDB", subdomains: "abcd", maxZoom: 18
+}).addTo(map);
+
+var heatLayer = L.heatLayer([], {
+  radius: HEAT_RADIUS, blur: HEAT_BLUR, gradient: GRADIENT, max: 1.0
+}).addTo(map);
+
+var pinGroup = L.layerGroup().addTo(map);
+
+function pinKey(p) { return p.lat + "," + p.lon; }
+function getColor(p) { var o = pinOverrides[pinKey(p)]; return o ? o.color : p.color; }
+function getLabel(p) { var o = pinOverrides[pinKey(p)]; return o ? o.label : p.label; }
+
+// Mini SVG bar chart
+function miniBar(data, tips, color) {
+  var maxVal = 0;
+  for (var i = 0; i < data.length; i++) if (data[i] > maxVal) maxVal = data[i];
+  if (!maxVal) maxVal = 1;
+  var w = 258, h = 44, n = data.length, bw = Math.floor((w - n) / n);
+  var svg = '<svg width="' + w + '" height="' + h + '" style="display:block;overflow:visible">';
+  for (var i = 0; i < n; i++) {
+    var bh = Math.max(2, Math.round((data[i] / maxVal) * h));
+    svg += '<rect x="' + (i*(bw+1)) + '" y="' + (h-bh) + '" width="' + bw
+         + '" height="' + bh + '" fill="' + color + '" rx="1" opacity="0.85">'
+         + '<title>' + tips[i] + ': ' + data[i] + ' visits</title></rect>';
+  }
+  return svg + '</svg>';
+}
+
+// Popup HTML builder
+function makePopupHtml(p, idx) {
+  var color = getColor(p), label = getLabel(p);
+  var hourTips = [];
+  for (var h = 0; h < 24; h++) hourTips.push(h + ":00");
+  var dayTips = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+
+  var grid = '<div class="classify-grid">';
+  for (var c = 0; c < MANUAL_CLASSES.length; c++) {
+    var mc = MANUAL_CLASSES[c];
+    var isSel = (mc[0] === color && mc[1] === label);
+    grid += '<button class="cls-btn' + (isSel ? ' selected' : '') + '" '
+          + 'onclick="applyClass(' + idx + ',\\'' + mc[0] + '\\',\\''
+          + mc[1].replace(/\'/g, "\\\\'") + '\\')">'
+          + '<span class="cls-swatch" style="background:' + mc[0] + '"></span>'
+          + mc[1] + '</button>';
+  }
+  grid += '</div>';
+
+  return '<div class="pin-popup">'
+    + '<h3 style="color:' + color + '">&#128205; #' + (idx+1) + ' &mdash; ' + label + '</h3>'
+    + '<div class="pin-stats">'
+    +   '<div class="pin-stat"><div class="val">' + p.visit_count + '</div><div class="lbl">Visits</div></div>'
+    +   '<div class="pin-stat"><div class="val">' + p.avg_hours.toFixed(1) + 'h</div><div class="lbl">Avg / visit</div></div>'
+    +   '<div class="pin-stat"><div class="val">' + p.total_hours.toFixed(1) + 'h</div><div class="lbl">Total time</div></div>'
+    + '</div>'
+    + '<div class="chart-title">Visits by hour of day</div>'
+    + miniBar(p.hour_dist, hourTips, "#3a9ad9")
+    + '<div class="bar-axis"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>23:00</span></div>'
+    + '<div class="chart-title">Visits by day of week</div>'
+    + miniBar(p.day_dist, dayTips, color)
+    + '<div class="bar-axis"><span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span></div>'
+    + '<div class="classify-section">'
+    +   '<div class="chart-title">&#9998; Classify this location</div>'
+    +   grid
+    + '</div></div>';
+}
+
+function applyClass(idx, color, label) {
+  pinOverrides[pinKey(PINS_DATA[idx])] = { color: color, label: label };
+  buildPins();
+  pinGroup.eachLayer(function(lyr) {
+    if (lyr._pinIdx === idx) lyr.openPopup();
+  });
+}
+
+function buildPins() {
+  pinGroup.clearLayers();
+  for (var i = 0; i < PINS_DATA.length; i++) {
+    var p = PINS_DATA[i], color = getColor(p);
+    var icon = L.divIcon({
+      html: '<div style="width:20px;height:20px;border-radius:50%;background:' + color
+          + ';border:2.5px solid rgba(255,255,255,0.85);'
+          + 'box-shadow:0 0 10px ' + color + ',0 0 4px rgba(0,0,0,0.9);'
+          + 'display:flex;align-items:center;justify-content:center;'
+          + 'font-size:9px;font-weight:bold;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,0.8);">'
+          + (i+1) + '</div>',
+      className: '', iconSize: [20,20], iconAnchor: [10,10]
+    });
+    var marker = L.marker([p.lat, p.lon], { icon: icon });
+    marker._pinIdx = i;
+    marker.bindPopup(makePopupHtml(p, i), { maxWidth: 340, minWidth: 290 });
+    (function(pin, idx) {
+      marker.on("popupopen", function() {
+        this.getPopup().setContent(makePopupHtml(pin, idx));
+      });
+    })(p, i);
+    marker.addTo(pinGroup);
+  }
+}
+buildPins();
+
+var showHeat = true, showPins = true;
+var slider    = document.getElementById("slider");
+var hourLabel = document.getElementById("hour-label");
+var subLabel  = document.getElementById("sub-label");
+var modeBadge = document.getElementById("mode-badge");
+var btnPlay   = document.getElementById("btn-play");
+var btnPrev   = document.getElementById("btn-prev");
+var btnNext   = document.getElementById("btn-next");
+var btnWd     = document.getElementById("btn-wd");
+var btnWe     = document.getElementById("btn-we");
+var btnHeat   = document.getElementById("btn-heat");
+var btnPins   = document.getElementById("btn-pins");
+var speedSel  = document.getElementById("speed-select");
+
+var strip = document.getElementById("hour-strip"), ticks = [];
+for (var h = 0; h < 24; h++) {
+  var tick = document.createElement("div");
+  tick.className = "hour-tick";
+  tick.style.background = PERIOD_COLS[h];
+  tick.title = h + ":00";
+  (function(hour) {
+    tick.addEventListener("click", function() { stopPlay(); showFrame(hour); });
+  })(h);
+  strip.appendChild(tick);
+  ticks.push(tick);
+}
+
+var currentFrame = 0, playing = false, timer = null;
+
+function showFrame(idx) {
+  currentFrame = ((idx % N) + N) % N;
+  slider.value = currentFrame;
+  hourLabel.textContent = currentFrame + ":00 - " + currentFrame + ":59";
+  hourLabel.style.color = PERIOD_COLS[currentFrame];
+  subLabel.textContent  = LABEL_DATA[currentFrame];
+  ticks.forEach(function(t, i) {
+    t.classList.toggle("active", i === currentFrame);
+    t.style.opacity = (i === currentFrame) ? "1" : "0.55";
+  });
+  if (showHeat) heatLayer.setLatLngs(HEAT_DATA[currentFrame]);
+}
+
+function switchMode(weekend) {
+  HEAT_DATA  = weekend ? WE_HEAT   : WD_HEAT;
+  LABEL_DATA = weekend ? WE_LABELS : WD_LABELS;
+  if (weekend) {
+    btnWd.className = "mode-btn";
+    btnWe.className = "mode-btn active-we";
+    modeBadge.textContent = "WEEKEND";
+    modeBadge.style.background = "#4a2a6a";
+    modeBadge.style.color = "#c47ef4";
+  } else {
+    btnWd.className = "mode-btn active-wd";
+    btnWe.className = "mode-btn";
+    modeBadge.textContent = "WEEKDAY";
+    modeBadge.style.background = "#1a4a8a";
+    modeBadge.style.color = "#7ec8f4";
+  }
+  showFrame(currentFrame);
+}
+
+btnWd.addEventListener("click", function() { stopPlay(); switchMode(false); });
+btnWe.addEventListener("click", function() { stopPlay(); switchMode(true);  });
+
+btnHeat.addEventListener("click", function() {
+  showHeat = !showHeat;
+  if (showHeat) {
+    heatLayer.setLatLngs(HEAT_DATA[currentFrame]);
+    btnHeat.textContent = "Heatmap ON";  btnHeat.className = "toggle-btn on";
+  } else {
+    heatLayer.setLatLngs([]);
+    btnHeat.textContent = "Heatmap OFF"; btnHeat.className = "toggle-btn off";
+  }
+});
+btnPins.addEventListener("click", function() {
+  showPins = !showPins;
+  if (showPins) {
+    buildPins(); btnPins.textContent = "Pins ON"; btnPins.className = "toggle-btn on";
+  } else {
+    pinGroup.clearLayers(); btnPins.textContent = "Pins OFF"; btnPins.className = "toggle-btn off";
+  }
+});
+
+function stepForward() {
+  var next = currentFrame + 1;
+  if (next >= N) { stopPlay(); return; }
+  showFrame(next);
+}
+function startPlay() {
+  playing = true; btnPlay.innerHTML = "&#9646;&#9646;";
+  timer = setInterval(stepForward, FRAME_MS);
+}
+function stopPlay() {
+  playing = false; btnPlay.innerHTML = "&#9654;";
+  clearInterval(timer); timer = null;
+}
+
+btnPlay.addEventListener("click",   function() { playing ? stopPlay() : startPlay(); });
+btnPrev.addEventListener("click",   function() { stopPlay(); showFrame(currentFrame - 1); });
+btnNext.addEventListener("click",   function() { stopPlay(); showFrame(currentFrame + 1); });
+slider.addEventListener("input",    function() { stopPlay(); showFrame(parseInt(slider.value)); });
+speedSel.addEventListener("change", function() {
+  FRAME_MS = parseInt(speedSel.value);
+  if (playing) { stopPlay(); startPlay(); }
+});
+
+switchMode(false);
+showFrame(0);
+"""
+        + auto_play_js
+        + """
+</script>
+</body>
+</html>"""
+    )
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out = os.path.join(OUTPUT_DIR, "location_heatmap_pins_with_information.html")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"\n    Saved -> {out}")
+    print("  Open directly in Chrome via file:// - no local server needed.")
+
+
+# ---------------------------------------------
+# MAIN
+# ---------------------------------------------
+
+def main():
+    print("=" * 55)
+    print("  Location History - Heatmap + Pins (no routes)")
+    print("=" * 55)
+
+    print(f"\n[1/3] Loading segments from: {JSON_FILE}")
+    segments = load_segments(JSON_FILE)
+    print(f"      Loaded {len(segments):,} raw segments")
+
+    print(f"\n[2/3] Parsing GPS points and visit pins (no routes)")
+    df, pins = parse_data(segments)
+    print(f"      GPS points : {len(df):,}")
+    print(f"      Pins       : {len(pins)} locations (top {TOP_N_PINS} by visit count)")
+
+    if df.empty:
+        print("\n  No GPS data found. Check JSON_FILE path and date range.")
+        return
+
+    print(f"\n[3/3] Building hourly heatmap frames (weekday + weekend)")
+    make_visualization(df, pins)
+
+    print(f"\n  Output: ./{OUTPUT_DIR}/location_heatmap_pins_with_information.html")
+    print("=" * 55)
+
+
+if __name__ == "__main__":
+    main()
